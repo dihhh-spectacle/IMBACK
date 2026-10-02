@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   secure-rdp:
-    runs-on: windows-2022
+    runs-on: windows-2025-vs2026
     timeout-minutes: 360
 
     steps:
