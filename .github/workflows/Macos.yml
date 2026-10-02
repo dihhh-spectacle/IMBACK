@@ -1,0 +1,198 @@
+name: RDP-2
+run-name: "RDP-1 #${{ github.run_number }} — ${{ github.event.inputs.deadline == '' && 'new session' || 'auto-continue' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      deadline:
+        description: "Leave empty. Used by auto-restart to keep the 24h deadline"
+        required: false
+        default: ""
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: tenki-macos-26-mini
+    timeout-minutes: 360
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Set 24h Deadline
+        run: |
+          deadline="${{ github.event.inputs.deadline }}"
+
+          if [ -z "$deadline" ]; then
+            deadline=$(( $(date -u +%s) + 86400 ))
+          fi
+
+          echo "DEADLINE=$deadline" >> "$GITHUB_ENV"
+          echo "Session deadline: $(date -u -r "$deadline") UTC"
+
+      - name: Lighten macOS
+        run: |
+          # Never sleep
+          sudo pmset -a sleep 0 displaysleep 0 disksleep 0 || true
+          nohup caffeinate -dimsu >/dev/null 2>&1 &
+
+          # Turn off Spotlight indexing
+          sudo mdutil -a -i off || true
+
+          # Turn off automatic software updates
+          sudo softwareupdate --schedule off || true
+
+          # Less visual junk (helps VNC speed)
+          defaults write com.apple.universalaccess reduceMotion -bool true || true
+          defaults write com.apple.universalaccess reduceTransparency -bool true || true
+          defaults write NSGlobalDomain NSAutomaticWindowAnimationsEnabled -bool false || true
+          defaults write com.apple.dock launchanim -bool false || true
+          defaults write com.apple.dock autohide-time-modifier -float 0 || true
+          defaults write com.apple.dock expose-animation-duration -float 0 || true
+          killall Dock || true
+
+          echo "macOS lightened."
+
+      - name: Create User and Enable Screen Sharing
+        run: |
+          # 8 chars because legacy VNC passwords max out at 8
+          PASS=$(python3 -c "import secrets,string;print(''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(8)))")
+
+          # Remove existing user if present
+          if id RDP >/dev/null 2>&1; then
+            sudo sysadminctl -deleteUser RDP || true
+          fi
+
+          # Create admin user
+          sudo sysadminctl -addUser RDP -fullName "RDP" -password "$PASS" -admin
+
+          # Enable Screen Sharing / Remote Management with a legacy VNC password
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -privs -all \
+            -restart -agent \
+            -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PASS"
+
+          # Fallback: load the screensharing daemon directly
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+
+          echo "RDP_CREDS=User: RDP | Password: $PASS" >> "$GITHUB_ENV"
+
+          if ! id RDP >/dev/null 2>&1; then
+            echo "::error::User creation failed"
+            exit 1
+          fi
+
+          echo "User created and Screen Sharing enabled."
+
+      - name: Install Tailscale
+        run: |
+          echo "Installing Tailscale..."
+
+          brew install tailscale
+          sudo tailscaled install-system-daemon
+
+          sleep 5
+          echo "Tailscale installed."
+
+      - name: Establish Tailscale Connection
+        run: |
+          echo "Connecting to Tailscale..."
+
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+            --hostname="gh-runner-$GITHUB_RUN_ID"
+
+          # Wait for Tailscale IPv4 address
+          tsIP=""
+          retries=0
+
+          while [ -z "$tsIP" ] && [ "$retries" -lt 20 ]; do
+            tsIP=$(tailscale ip -4 2>/dev/null | head -n 1 || true)
+
+            if [ -n "$tsIP" ]; then
+              break
+            fi
+
+            echo "Waiting for Tailscale IP..."
+            sleep 5
+            retries=$((retries + 1))
+          done
+
+          if [ -z "$tsIP" ]; then
+            echo "::error::Tailscale IP was not assigned."
+            exit 1
+          fi
+
+          echo "TAILSCALE_IP=$tsIP" >> "$GITHUB_ENV"
+          echo "Tailscale IP: $tsIP"
+
+      - name: Verify Screen Sharing Accessibility
+        run: |
+          echo "Testing VNC connectivity..."
+          echo "Tailscale IP: $TAILSCALE_IP"
+
+          if ! nc -z -w 10 "$TAILSCALE_IP" 5900; then
+            echo "::error::TCP connection to port 5900 failed."
+            exit 1
+          fi
+
+          echo "VNC TCP connectivity successful!"
+
+      - name: Show Access Information
+        run: |
+          echo ""
+          echo "=========================================="
+          echo " SCREEN SHARING ACCESS (VNC)"
+          echo "=========================================="
+          echo "Address: $TAILSCALE_IP:5900"
+          echo "$RDP_CREDS"
+          echo "=========================================="
+
+      - name: Maintain Connection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          deadline=$DEADLINE
+          now=$(date -u +%s)
+
+          # Start the next runner at ~5h10m, then stay alive ~25 more minutes
+          handoverAt=$(( now + 310 * 60 ))
+          endAt=$(( now + 335 * 60 ))
+
+          # Phase 1: keep the session alive
+          while [ "$(date -u +%s)" -lt "$handoverAt" ] && [ "$(date -u +%s)" -lt "$deadline" ]; do
+            echo "[$(date)] VNC Active - Runner is alive"
+            sleep 300
+          done
+
+          now=$(date -u +%s)
+
+          if [ "$now" -ge $(( deadline - 600 )) ]; then
+            echo "24h deadline reached. Not starting a new runner."
+            exit 0
+          fi
+
+          # Phase 2: start the next runner
+          echo "Starting next runner..."
+
+          command -v gh >/dev/null 2>&1 || brew install gh
+
+          if gh workflow run "RDP-1" \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}" \
+            -f deadline="$deadline"; then
+            echo "Next runner started. Check the Actions tab for the new IP and password."
+          else
+            echo "Failed to start next runner."
+          fi
+
+          # Phase 3: overlap so you have time to switch over
+          while [ "$(date -u +%s)" -lt "$endAt" ] && [ "$(date -u +%s)" -lt "$deadline" ]; do
+            echo "[$(date)] Handover - this runner is about to end"
+            sleep 60
+          done
