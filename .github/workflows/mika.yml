@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   secure-rdp:
-    runs-on: windows-2025-vs2026
+    runs-on: tenki-standard-small-2c-4g
     timeout-minutes: 360
 
     steps:
@@ -144,6 +144,7 @@ jobs:
 
           Write-Host "Recurring maintenance tasks disabled."
           
+
       - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
