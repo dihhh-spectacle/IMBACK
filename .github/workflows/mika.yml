@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   secure-rdp:
-    runs-on: tenki-macos-26-mini
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
