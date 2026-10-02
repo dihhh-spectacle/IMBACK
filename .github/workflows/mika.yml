@@ -82,7 +82,6 @@ jobs:
 
           # Turn off Defender real-time scanning
           try { Set-MpPreference -DisableRealtimeMonitoring $true } catch {}
-          try { Add-MpPreference -ExclusionPath "C:\" } catch {}
 
           # Stop heavy background services, but leave them startable on demand (Manual)
           $services = @("WSearch", "wuauserv", "UsoSvc", "SysMain", "DiagTrack", "DoSvc", "MapsBroker")
@@ -93,23 +92,12 @@ jobs:
             } catch {}
           }
 
-          # Server Manager pops up at every logon and eats CPU - kill it
-          try { Get-ScheduledTask -TaskName "ServerManager" -ErrorAction SilentlyContinue | Disable-ScheduledTask | Out-Null } catch {}
-
-          # Give the foreground app (what you're using over RDP) CPU priority
-          try {
-            Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl' -Name "Win32PrioritySeparation" -Value 38 -Type DWord -Force
-          } catch {}
-
-          # RDP side: no wallpaper, 16-bit color (3 = 16-bit), lighter encoder
+          # RDP side: no wallpaper, 16-bit color
           try {
             $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
             if (-not (Test-Path $ts)) { New-Item -Path $ts -Force | Out-Null }
             Set-ItemProperty -Path $ts -Name "fNoRemoteDesktopWallpaper" -Value 1 -Type DWord -Force
-            Set-ItemProperty -Path $ts -Name "ColorDepth" -Value 3 -Type DWord -Force
-            Set-ItemProperty -Path $ts -Name "AVC444ModePreferred" -Value 0 -Type DWord -Force
-            Set-ItemProperty -Path $ts -Name "AVCHardwareEncodePreferred" -Value 0 -Type DWord -Force
-            Set-ItemProperty -Path $ts -Name "bEnumerateHWBeforeSW" -Value 0 -Type DWord -Force
+            Set-ItemProperty -Path $ts -Name "ColorDepth" -Value 4 -Type DWord -Force
           } catch {}
 
           # Best performance visual settings for new users (applies to the RDP user)
@@ -156,14 +144,47 @@ jobs:
 
           Write-Host "Recurring maintenance tasks disabled."
 
+      - name: Remove Bloatware
+        run: |
+          Write-Host "Removing bloatware..."
+
+          # Kill and disable OneDrive
+          try {
+            Stop-Process -Name OneDrive -Force -ErrorAction SilentlyContinue
+            Start-Process "$env:SystemRoot\SysWOW64\OneDriveSetup.exe" -ArgumentList "/uninstall" -Wait -ErrorAction SilentlyContinue
+          } catch {}
+
+          # Remove default UWP apps nobody needs on a headless dev box
+          $apps = @(
+            "*Xbox*", "*Teams*", "*Skype*", "*ZuneMusic*", "*ZuneVideo*",
+            "*BingWeather*", "*BingNews*", "*GetHelp*", "*Getstarted*",
+            "*Messaging*", "*Office.OneNote*", "*People*", "*SolitaireCollection*",
+            "*WindowsMaps*", "*WindowsFeedbackHub*", "*YourPhone*", "*MixedReality*"
+          )
+          foreach ($app in $apps) {
+            Get-AppxPackage -Name $app -AllUsers -ErrorAction SilentlyContinue |
+              Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+          }
+
+          # Free disk space: strip unused pre-installed dev toolcaches from the runner image
+          $toolcache = "C:\hostedtoolcache\windows"
+          if (Test-Path $toolcache) {
+            $keep = @("node")  # keep only what this workflow might use; add more names to spare them
+            Get-ChildItem $toolcache -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $keep -notcontains $_.Name } |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Bloatware removed."
+
       - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
 
           $charSet = @{
-            Upper   = [char[]](65..90)
-            Lower   = [char[]](97..122)
-            Number  = [char[]](48..57)
+            Upper = [char[]](65..90)
+            Lower = [char[]](97..122)
+            Number = [char[]](48..57)
             Special = (
               [char[]](33..47) +
               [char[]](58..64) +
@@ -173,9 +194,9 @@ jobs:
           }
 
           $rawPassword = @()
-          $rawPassword += $charSet.Upper   | Get-Random -Count 4
-          $rawPassword += $charSet.Lower   | Get-Random -Count 4
-          $rawPassword += $charSet.Number  | Get-Random -Count 4
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
 
           $password = -join ($rawPassword | Sort-Object { Get-Random })
@@ -221,6 +242,68 @@ jobs:
 
           Write-Host "RDP user created successfully."
 
+      - name: Install Mesa3D (Software GPU - llvmpipe)
+        run: |
+          Write-Host "Installing Mesa3D llvmpipe (software OpenGL)..."
+
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest"
+          $asset = $release.assets | Where-Object { $_.name -like "*release-msvc.7z" } | Select-Object -First 1
+
+          if (-not $asset) {
+            Write-Error "Could not find Mesa3D release asset."
+            exit 1
+          }
+
+          $archive = "$env:TEMP\mesa3d.7z"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
+
+          $extractPath = "$env:TEMP\mesa3d"
+          & "C:\Program Files\7-Zip\7z.exe" x $archive -o"$extractPath" -y | Out-Null
+
+          # Back up the real opengl32.dll, then drop in the llvmpipe software one
+          $sys32 = "$env:WINDIR\System32\opengl32.dll"
+
+          takeown /f $sys32 | Out-Null
+          icacls $sys32 /grant "*S-1-5-32-544:F" | Out-Null
+
+          if (-not (Test-Path "$sys32.bak")) {
+            Copy-Item $sys32 "$sys32.bak" -Force -ErrorAction SilentlyContinue
+          }
+
+          $llvmpipeDll = Get-ChildItem -Path $extractPath -Recurse -Filter "opengl32.dll" |
+            Where-Object { $_.FullName -like "*x64*" } |
+            Select-Object -First 1
+
+          if (-not $llvmpipeDll) {
+            Write-Error "opengl32.dll not found in Mesa3D archive."
+            exit 1
+          }
+
+          Copy-Item $llvmpipeDll.FullName $sys32 -Force
+
+          # Also patch the 32-bit build, for 32-bit apps (e.g. Android emulators)
+          $syswow64 = "$env:WINDIR\SysWOW64\opengl32.dll"
+
+          takeown /f $syswow64 | Out-Null
+          icacls $syswow64 /grant "*S-1-5-32-544:F" | Out-Null
+
+          if (-not (Test-Path "$syswow64.bak")) {
+            Copy-Item $syswow64 "$syswow64.bak" -Force -ErrorAction SilentlyContinue
+          }
+
+          $llvmpipeDll32 = Get-ChildItem -Path $extractPath -Recurse -Filter "opengl32.dll" |
+            Where-Object { $_.FullName -like "*x86*" } |
+            Select-Object -First 1
+
+          if ($llvmpipeDll32) {
+            Copy-Item $llvmpipeDll32.FullName $syswow64 -Force
+            Write-Host "32-bit llvmpipe installed too."
+          } else {
+            Write-Host "No 32-bit build found in this Mesa3D release; 32-bit apps will still use the original driver."
+          }
+
+          Write-Host "Mesa3D llvmpipe installed. Apps needing OpenGL now render in software."
+
       - name: Install Tailscale
         run: |
           Write-Host "Installing Tailscale..."
@@ -254,8 +337,7 @@ jobs:
 
           & $tailscale up `
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname=gh-runner-$env:GITHUB_RUN_ID `
-            --accept-dns=false
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
 
           if ($LASTEXITCODE -ne 0) {
             Write-Error "Tailscale connection failed."
