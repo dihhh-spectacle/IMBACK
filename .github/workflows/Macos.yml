@@ -91,7 +91,7 @@ jobs:
           # Fallback: load the screensharing daemon directly
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
 
-          echo "RDP_CREDS=User: RDP | Password: $PASS" >> "$GITHUB_ENV"
+          echo "VNC_PASS=$PASS" >> "$GITHUB_ENV"
 
           if ! dscl . -read /Users/RDP >/dev/null 2>&1; then
             echo "::error::User creation failed"
@@ -100,69 +100,64 @@ jobs:
 
           echo "User created and Screen Sharing enabled."
 
-      - name: Install Tailscale
-        timeout-minutes: 10
+      - name: Verify VNC Is Listening
         run: |
-          echo "Installing Tailscale..."
-
-          brew install tailscale
-          sudo tailscaled install-system-daemon
-
-          sleep 5
-          echo "Tailscale installed."
-
-      - name: Establish Tailscale Connection
-        run: |
-          echo "Connecting to Tailscale..."
-
-          sudo tailscale up \
-            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
-            --hostname="gh-runner-$GITHUB_RUN_ID"
-
-          # Wait for Tailscale IPv4 address
-          tsIP=""
-          retries=0
-
-          while [ -z "$tsIP" ] && [ "$retries" -lt 20 ]; do
-            tsIP=$(tailscale ip -4 2>/dev/null | head -n 1 || true)
-
-            if [ -n "$tsIP" ]; then
-              break
+          for i in $(seq 1 12); do
+            if nc -z -w 5 127.0.0.1 5900; then
+              echo "VNC is listening on 5900."
+              exit 0
             fi
-
-            echo "Waiting for Tailscale IP..."
+            echo "Waiting for VNC..."
             sleep 5
-            retries=$((retries + 1))
           done
 
-          if [ -z "$tsIP" ]; then
-            echo "::error::Tailscale IP was not assigned."
-            exit 1
-          fi
+          echo "::error::Nothing listening on port 5900."
+          exit 1
 
-          echo "TAILSCALE_IP=$tsIP" >> "$GITHUB_ENV"
-          echo "Tailscale IP: $tsIP"
-
-      - name: Verify Screen Sharing Accessibility
+      - name: Install Cloudflared and noVNC
+        timeout-minutes: 10
         run: |
-          echo "Testing VNC connectivity..."
-          echo "Tailscale IP: $TAILSCALE_IP"
+          brew install cloudflared websockify
+          git clone --depth 1 https://github.com/novnc/noVNC.git "$HOME/noVNC"
+          echo "Installed."
 
-          if ! nc -z -w 10 "$TAILSCALE_IP" 5900; then
-            echo "::error::TCP connection to port 5900 failed."
+      - name: Start noVNC and Cloudflare Tunnel
+        timeout-minutes: 5
+        run: |
+          # Browser <-> VNC bridge
+          nohup websockify --web "$HOME/noVNC" 6080 127.0.0.1:5900 > "$HOME/websockify.log" 2>&1 &
+          sleep 3
+
+          # Cloudflare quick tunnel (no account or token needed)
+          nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 > "$HOME/cloudflared.log" 2>&1 &
+
+          url=""
+          for i in $(seq 1 30); do
+            url=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "$HOME/cloudflared.log" | head -n 1 || true)
+            if [ -n "$url" ]; then
+              break
+            fi
+            echo "Waiting for tunnel URL..."
+            sleep 2
+          done
+
+          if [ -z "$url" ]; then
+            echo "::error::Cloudflare tunnel URL not found."
+            cat "$HOME/cloudflared.log"
             exit 1
           fi
 
-          echo "VNC TCP connectivity successful!"
+          echo "TUNNEL_URL=$url" >> "$GITHUB_ENV"
+          echo "Tunnel is up: $url"
 
       - name: Show Access Information
         run: |
           echo ""
           echo "=========================================="
-          echo " SCREEN SHARING ACCESS (VNC)"
+          echo " SCREEN ACCESS (noVNC over Cloudflare)"
           echo "=========================================="
-          echo "Address: $TAILSCALE_IP:5900"
-          echo "$RDP_CREDS"
+          echo "Open: $TUNNEL_URL/vnc.html?autoconnect=true"
+          echo "Password: $VNC_PASS"
           echo "=========================================="
 
       - name: Maintain Connection
@@ -176,9 +171,11 @@ jobs:
           handoverAt=$(( now + 310 * 60 ))
           endAt=$(( now + 335 * 60 ))
 
-          # Phase 1: keep the session alive
+          # Phase 1: keep the session alive (and restart the tunnel pieces if they die)
           while [ "$(date -u +%s)" -lt "$handoverAt" ] && [ "$(date -u +%s)" -lt "$deadline" ]; do
-            echo "[$(date)] VNC Active - Runner is alive"
+            pgrep -f websockify >/dev/null || \
+              nohup websockify --web "$HOME/noVNC" 6080 127.0.0.1:5900 >> "$HOME/websockify.log" 2>&1 &
+            echo "[$(date)] Active - Runner is alive - $TUNNEL_URL/vnc.html?autoconnect=true"
             sleep 300
           done
 
@@ -198,7 +195,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --ref "${{ github.ref_name }}" \
             -f deadline="$deadline"; then
-            echo "Next runner started. Check the Actions tab for the new IP and password."
+            echo "Next runner started. Check the Actions tab for the new link and password."
           else
             echo "Failed to start next runner."
           fi
