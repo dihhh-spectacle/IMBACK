@@ -1,0 +1,431 @@
+name: RDP-1
+run-name: "RDP-1 #${{ github.run_number }} — ${{ github.event.inputs.deadline == '' && 'new session' || 'auto-continue' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      deadline:
+        description: "Leave empty. Used by auto-restart to keep the 24h deadline"
+        required: false
+        default: ""
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Set 24h Deadline
+        run: |
+          $deadline = "${{ github.event.inputs.deadline }}"
+
+          if ([string]::IsNullOrWhiteSpace($deadline)) {
+            $deadline = [DateTimeOffset]::UtcNow.AddHours(24).ToUnixTimeSeconds()
+          }
+
+          "DEADLINE=$deadline" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append `
+              -Encoding utf8
+
+          $endTime = [DateTimeOffset]::FromUnixTimeSeconds([long]$deadline).UtcDateTime
+          Write-Host "Session deadline: $endTime UTC"
+
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
+
+          # Disable Network Level Authentication
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" `
+            -Value 0 `
+            -Force
+
+          # Set RDP security layer
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" `
+            -Value 0 `
+            -Force
+
+          # Remove old firewall rule if it exists
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          # Allow RDP on port 3389
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=3389
+
+          # Restart Remote Desktop service
+          Restart-Service -Name TermService -Force
+
+          Write-Host "RDP configured successfully."
+
+      - name: Lighten Windows
+        run: |
+          # High performance power plan
+          try { powercfg /setactive SCHEME_MIN } catch {}
+
+          # Turn off Defender real-time scanning
+          try { Set-MpPreference -DisableRealtimeMonitoring $true } catch {}
+
+          # Stop heavy background services, but leave them startable on demand (Manual)
+          $services = @("WSearch", "wuauserv", "UsoSvc", "SysMain", "DiagTrack", "DoSvc", "MapsBroker")
+          foreach ($svc in $services) {
+            try {
+              Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+              Set-Service -Name $svc -StartupType Manual -ErrorAction SilentlyContinue
+            } catch {}
+          }
+
+          # RDP side: no wallpaper, 16-bit color
+          try {
+            $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+            if (-not (Test-Path $ts)) { New-Item -Path $ts -Force | Out-Null }
+            Set-ItemProperty -Path $ts -Name "fNoRemoteDesktopWallpaper" -Value 1 -Type DWord -Force
+            Set-ItemProperty -Path $ts -Name "ColorDepth" -Value 4 -Type DWord -Force
+          } catch {}
+
+          # Best performance visual settings for new users (applies to the RDP user)
+          try {
+            reg load HKU\DefUser C:\Users\Default\NTUSER.DAT
+            reg add "HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f
+            reg add "HKU\DefUser\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f
+            reg add "HKU\DefUser\Control Panel\Desktop" /v DragFullWindows /t REG_SZ /d 0 /f
+            reg add "HKU\DefUser\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f
+            reg add "HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f
+            reg add "HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAnimations /t REG_DWORD /d 0 /f
+            [gc]::Collect()
+            Start-Sleep -Seconds 2
+            reg unload HKU\DefUser
+          } catch {}
+
+          # Same tweaks applied directly to the current admin account (HKCU)
+          try {
+            reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f
+            reg add "HKCU\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f
+            reg add "HKCU\Control Panel\Desktop" /v DragFullWindows /t REG_SZ /d 0 /f
+            reg add "HKCU\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f
+            reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f
+            reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAnimations /t REG_DWORD /d 0 /f
+          } catch {}
+
+          Write-Host "Windows lightened."
+
+      - name: Disable Recurring Maintenance Tasks
+        run: |
+          $tasks = @(
+            "\Microsoft\Windows\Windows Defender\Windows Defender Scheduled Scan",
+            "\Microsoft\Windows\Windows Defender\Windows Defender Verification",
+            "\Microsoft\Windows\Windows Defender\Windows Defender Cache Maintenance",
+            "\Microsoft\Windows\Windows Defender\Windows Defender Cleanup",
+            "\Microsoft\Windows\UpdateOrchestrator\Schedule Scan",
+            "\Microsoft\Windows\UpdateOrchestrator\Schedule Scan Static Task",
+            "\Microsoft\Windows\TaskScheduler\Maintenance Configurator",
+            "\Microsoft\Windows\Maintenance\WinSAT"
+          )
+          foreach ($t in $tasks) {
+            try { Disable-ScheduledTask -TaskName ($t.Split('\')[-1]) -TaskPath ($t.Substring(0, $t.LastIndexOf('\') + 1)) -ErrorAction SilentlyContinue | Out-Null } catch {}
+          }
+
+          Write-Host "Recurring maintenance tasks disabled."
+
+      - name: Remove Bloatware
+        run: |
+          Write-Host "Removing bloatware..."
+
+          # Kill and disable OneDrive
+          try {
+            Stop-Process -Name OneDrive -Force -ErrorAction SilentlyContinue
+            Start-Process "$env:SystemRoot\SysWOW64\OneDriveSetup.exe" -ArgumentList "/uninstall" -Wait -ErrorAction SilentlyContinue
+          } catch {}
+
+          # Remove default UWP apps nobody needs on a headless dev box
+          $apps = @(
+            "*Xbox*", "*Teams*", "*Skype*", "*ZuneMusic*", "*ZuneVideo*",
+            "*BingWeather*", "*BingNews*", "*GetHelp*", "*Getstarted*",
+            "*Messaging*", "*Office.OneNote*", "*People*", "*SolitaireCollection*",
+            "*WindowsMaps*", "*WindowsFeedbackHub*", "*YourPhone*", "*MixedReality*"
+          )
+          foreach ($app in $apps) {
+            Get-AppxPackage -Name $app -AllUsers -ErrorAction SilentlyContinue |
+              Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+          }
+
+          # Free disk space: strip unused pre-installed dev toolcaches from the runner image
+          $toolcache = "C:\hostedtoolcache\windows"
+          if (Test-Path $toolcache) {
+            $keep = @("node")  # keep only what this workflow might use; add more names to spare them
+            Get-ChildItem $toolcache -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $keep -notcontains $_.Name } |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Bloatware removed."
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+
+          $charSet = @{
+            Upper = [char[]](65..90)
+            Lower = [char[]](97..122)
+            Number = [char[]](48..57)
+            Special = (
+              [char[]](33..47) +
+              [char[]](58..64) +
+              [char[]](91..96) +
+              [char[]](123..126)
+            )
+          }
+
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          $securePass = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          # Remove existing user if present
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name "RDP"
+          }
+
+          # Create RDP account
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePass `
+            -AccountNeverExpires `
+            -PasswordNeverExpires
+
+          # Add required groups
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "RDP"
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP"
+
+          # Store credentials in environment
+          "RDP_CREDS=User: RDP | Password: $password" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append `
+              -Encoding utf8
+
+          # Verify user creation
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            Write-Error "User creation failed"
+            exit 1
+          }
+
+          Write-Host "RDP user created successfully."
+
+      - name: Install Mesa3D (Software GPU - llvmpipe)
+        run: |
+          Write-Host "Installing Mesa3D llvmpipe (software OpenGL)..."
+
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest"
+          $asset = $release.assets | Where-Object { $_.name -like "*release-msvc.7z" } | Select-Object -First 1
+
+          if (-not $asset) {
+            Write-Error "Could not find Mesa3D release asset."
+            exit 1
+          }
+
+          $archive = "$env:TEMP\mesa3d.7z"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
+
+          $extractPath = "$env:TEMP\mesa3d"
+          & "C:\Program Files\7-Zip\7z.exe" x $archive -o"$extractPath" -y | Out-Null
+
+          # Back up the real opengl32.dll, then drop in the llvmpipe software one
+          $sys32 = "$env:WINDIR\System32\opengl32.dll"
+
+          takeown /f $sys32 | Out-Null
+          icacls $sys32 /grant "*S-1-5-32-544:F" | Out-Null
+
+          if (-not (Test-Path "$sys32.bak")) {
+            Copy-Item $sys32 "$sys32.bak" -Force -ErrorAction SilentlyContinue
+          }
+
+          $llvmpipeDll = Get-ChildItem -Path $extractPath -Recurse -Filter "opengl32.dll" |
+            Where-Object { $_.FullName -like "*x64*" } |
+            Select-Object -First 1
+
+          if (-not $llvmpipeDll) {
+            Write-Error "opengl32.dll not found in Mesa3D archive."
+            exit 1
+          }
+
+          Copy-Item $llvmpipeDll.FullName $sys32 -Force
+
+          Write-Host "Mesa3D llvmpipe installed. Apps needing OpenGL now render in software."
+
+      - name: Install Tailscale
+        run: |
+          Write-Host "Installing Tailscale..."
+
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri $tsUrl `
+            -OutFile $installerPath
+
+          Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $installerPath -Force
+
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+            Write-Error "Tailscale installation failed."
+            exit 1
+          }
+
+          Write-Host "Tailscale installed successfully."
+
+      - name: Establish Tailscale Connection
+        run: |
+          Write-Host "Connecting to Tailscale..."
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $tailscale up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Tailscale connection failed."
+            exit 1
+          }
+
+          # Wait for Tailscale IPv4 address
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 20) {
+            $tsIP = (& $tailscale ip -4 2>$null | Select-Object -First 1).Trim()
+
+            if ($tsIP) {
+              break
+            }
+
+            Write-Host "Waiting for Tailscale IP..."
+            Start-Sleep -Seconds 5
+            $retries++
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Tailscale IP was not assigned."
+            exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append `
+              -Encoding utf8
+
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Testing RDP connectivity..."
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          $testResult = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "TCP connection to RDP port 3389 failed."
+            exit 1
+          }
+
+          Write-Host "RDP TCP connectivity successful!"
+
+      - name: Show Access Information
+        run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host " RDP ACCESS"
+          Write-Host "=========================================="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $($env:RDP_CREDS)"
+          Write-Host "=========================================="
+
+      - name: Maintain Connection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $deadline = [long]$env:DEADLINE
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+
+          # Start the next runner at ~5h10m, then stay alive ~25 more minutes
+          $handoverAt = $now + (310 * 60)
+          $endAt = $now + (335 * 60)
+
+          # Phase 1: keep the session alive
+          while (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt $handoverAt) -and
+                 ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt $deadline)) {
+            try { Set-MpPreference -DisableRealtimeMonitoring $true } catch {}
+            try {
+              Stop-Service -Name WSearch, SysMain, DiagTrack -Force -ErrorAction SilentlyContinue
+            } catch {}
+            Write-Host "[$(Get-Date)] RDP Active - Runner is alive"
+            Start-Sleep -Seconds 300
+          }
+
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+
+          if ($now -ge ($deadline - 600)) {
+            Write-Host "24h deadline reached. Not starting a new runner."
+            exit 0
+          }
+
+          # Phase 2: start the next runner
+          Write-Host "Starting next runner..."
+
+          gh workflow run mika.yml `
+            --repo ${{ github.repository }} `
+            --ref ${{ github.ref_name }} `
+            -f deadline=$deadline
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Failed to start next runner."
+          } else {
+            Write-Host "Next runner started. Check the Actions tab for the new IP and password."
+          }
+
+          # Phase 3: overlap so you have time to switch over
+          while (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt $endAt) -and
+                 ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt $deadline)) {
+            Write-Host "[$(Get-Date)] Handover - this runner is about to end"
+            Start-Sleep -Seconds 60
+          }
