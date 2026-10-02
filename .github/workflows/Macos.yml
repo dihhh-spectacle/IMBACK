@@ -57,31 +57,12 @@ jobs:
 
           echo "macOS lightened."
 
-      - name: Create User and Enable Screen Sharing
+      - name: Enable Screen Sharing
         timeout-minutes: 3
         run: |
-          # 8 chars because legacy VNC passwords max out at 8
-          PASS=$(python3 -c "import secrets,string;print(''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(8)))")
+          # Hardcoded, max 8 chars (legacy VNC limit). Change it here if you want.
+          PASS="Pr8xK2mQ"
 
-          # Remove existing user if present
-          if dscl . -read /Users/RDP >/dev/null 2>&1; then
-            sudo dscl . -delete /Users/RDP || true
-            sudo rm -rf /Users/RDP || true
-          fi
-
-          # Create admin user with dscl (no prompts, no secure token needed)
-          sudo dscl . -create /Users/RDP
-          sudo dscl . -create /Users/RDP UserShell /bin/zsh
-          sudo dscl . -create /Users/RDP RealName "RDP"
-          sudo dscl . -create /Users/RDP UniqueID 599
-          sudo dscl . -create /Users/RDP PrimaryGroupID 20
-          sudo dscl . -create /Users/RDP NFSHomeDirectory /Users/RDP
-          sudo dscl . -passwd /Users/RDP "$PASS"
-          sudo dscl . -append /Groups/admin GroupMembership RDP
-          sudo mkdir -p /Users/RDP
-          sudo chown -R RDP:staff /Users/RDP
-
-          # Enable Screen Sharing / Remote Management with a legacy VNC password
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on \
             -privs -all \
@@ -92,13 +73,7 @@ jobs:
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
 
           echo "VNC_PASS=$PASS" >> "$GITHUB_ENV"
-
-          if ! dscl . -read /Users/RDP >/dev/null 2>&1; then
-            echo "::error::User creation failed"
-            exit 1
-          fi
-
-          echo "User created and Screen Sharing enabled."
+          echo "Screen Sharing enabled."
 
       - name: Verify VNC Is Listening
         run: |
@@ -154,10 +129,9 @@ jobs:
         run: |
           echo ""
           echo "=========================================="
-          echo " SCREEN ACCESS (noVNC over Cloudflare)"
+          echo " JUST OPEN THIS LINK"
           echo "=========================================="
-          echo "Open: $TUNNEL_URL/vnc.html?autoconnect=true"
-          echo "Password: $VNC_PASS"
+          echo "$TUNNEL_URL/vnc.html?autoconnect=true&password=$VNC_PASS"
           echo "=========================================="
 
       - name: Maintain Connection
@@ -171,11 +145,11 @@ jobs:
           handoverAt=$(( now + 310 * 60 ))
           endAt=$(( now + 335 * 60 ))
 
-          # Phase 1: keep the session alive (and restart the tunnel pieces if they die)
+          # Phase 1: keep the session alive
           while [ "$(date -u +%s)" -lt "$handoverAt" ] && [ "$(date -u +%s)" -lt "$deadline" ]; do
             pgrep -f websockify >/dev/null || \
               nohup websockify --web "$HOME/noVNC" 6080 127.0.0.1:5900 >> "$HOME/websockify.log" 2>&1 &
-            echo "[$(date)] Active - Runner is alive - $TUNNEL_URL/vnc.html?autoconnect=true"
+            echo "[$(date)] Active - $TUNNEL_URL/vnc.html?autoconnect=true&password=$VNC_PASS"
             sleep 300
           done
 
@@ -195,7 +169,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --ref "${{ github.ref_name }}" \
             -f deadline="$deadline"; then
-            echo "Next runner started. Check the Actions tab for the new link and password."
+            echo "Next runner started. Check the Actions tab for the new link."
           else
             echo "Failed to start next runner."
           fi
