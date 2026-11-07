@@ -1,5 +1,5 @@
 name: RDP-2
-run-name: "RDP-1 #${{ github.run_number }} — ${{ github.event.inputs.deadline == '' && 'new session' || 'auto-continue' }}"
+run-name: "RDP-1 #${{ github.run_number }} - ${{ github.event.inputs.deadline && 'auto-continue' || 'new session' }}"
 
 on:
   workflow_dispatch:
@@ -139,7 +139,7 @@ jobs:
             "\Microsoft\Windows\Maintenance\WinSAT"
           )
           foreach ($t in $tasks) {
-            try { Disable-ScheduledTask -TaskName ($t.Split('\')[-1]) -TaskPath ($t.Substring(0, $t.LastIndexOf('\') + 1)) -ErrorAction SilentlyContinue | Out-Null } catch {}
+            try { Disable-ScheduledTask -TaskName ($t.Split('\\')[-1]) -TaskPath ($t.Substring(0, $t.LastIndexOf('\\') + 1)) -ErrorAction SilentlyContinue | Out-Null } catch {}
           }
 
           Write-Host "Recurring maintenance tasks disabled."
@@ -361,7 +361,7 @@ jobs:
           gh workflow run mika.yml `
             --repo ${{ github.repository }} `
             --ref ${{ github.ref_name }} `
-            -f deadline=$deadline
+            -f "deadline=$deadline"
 
           if ($LASTEXITCODE -ne 0) {
             Write-Host "Failed to start next runner."
