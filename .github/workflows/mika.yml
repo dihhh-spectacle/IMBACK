@@ -209,67 +209,44 @@ jobs:
 
           Write-Host "RDP user created successfully."
 
-      - name: Install Mesa3D (Software GPU - llvmpipe)
+            - name: Install Mesa3D (Software GPU - llvmpipe)
+        continue-on-error: true
         run: |
-          Write-Host "Installing Mesa3D llvmpipe (software OpenGL)..."
-
           $release = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest"
           $asset = $release.assets | Where-Object { $_.name -like "*release-msvc.7z" } | Select-Object -First 1
-
-          if (-not $asset) {
-            Write-Error "Could not find Mesa3D release asset."
-            exit 1
-          }
+          if (-not $asset) { throw "No Mesa asset found" }
+          Write-Host "Asset: $($asset.name)"
 
           $archive = "$env:TEMP\mesa3d.7z"
+          $extractPath = "$env:TEMP\mesa3d"
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
 
-          $extractPath = "$env:TEMP\mesa3d"
-          & "C:\Program Files\7-Zip\7z.exe" x $archive -o"$extractPath" -y | Out-Null
+          $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) { $sevenZip = "C:\Program Files\7-Zip\7z.exe" }
+          & $sevenZip x $archive -o"$extractPath" -y | Out-Null
+          Write-Host "7z exit code: $LASTEXITCODE"
 
-          # Back up the real opengl32.dll, then drop in the llvmpipe software one
-          $sys32 = "$env:WINDIR\System32\opengl32.dll"
+          # Diagnostics: show where the DLLs landed
+          Get-ChildItem $extractPath -Recurse -Include opengl32.dll,libgallium_wgl.dll |
+            ForEach-Object { Write-Host $_.FullName }
 
-          takeown /f $sys32 | Out-Null
-          icacls $sys32 /grant "*S-1-5-32-544:F" | Out-Null
-
-          if (-not (Test-Path "$sys32.bak")) {
-            Copy-Item $sys32 "$sys32.bak" -Force -ErrorAction SilentlyContinue
+          function Install-Mesa($arch, $dest) {
+            $dlls = Get-ChildItem $extractPath -Recurse -Include opengl32.dll,libgallium_wgl.dll |
+              Where-Object { $_.FullName -match "[\\/]$arch[\\/]" }
+            if (-not ($dlls | Where-Object Name -eq 'opengl32.dll')) {
+              Write-Host "No $arch opengl32.dll in archive, skipping."
+              return
+            }
+            $target = "$dest\opengl32.dll"
+            takeown /f $target | Out-Null
+            icacls $target /grant "*S-1-5-32-544:F" | Out-Null
+            if (-not (Test-Path "$target.bak")) { Copy-Item $target "$target.bak" -Force }
+            foreach ($d in $dlls) { Copy-Item $d.FullName $dest -Force }
+            Write-Host "Mesa $arch installed to $dest"
           }
 
-          $llvmpipeDll = Get-ChildItem -Path $extractPath -Recurse -Filter "opengl32.dll" |
-            Where-Object { $_.FullName -like "*x64*" } |
-            Select-Object -First 1
-
-          if (-not $llvmpipeDll) {
-            Write-Error "opengl32.dll not found in Mesa3D archive."
-            exit 1
-          }
-
-          Copy-Item $llvmpipeDll.FullName $sys32 -Force
-
-          # Also patch the 32-bit build, for 32-bit apps (e.g. Android emulators)
-          $syswow64 = "$env:WINDIR\SysWOW64\opengl32.dll"
-
-          takeown /f $syswow64 | Out-Null
-          icacls $syswow64 /grant "*S-1-5-32-544:F" | Out-Null
-
-          if (-not (Test-Path "$syswow64.bak")) {
-            Copy-Item $syswow64 "$syswow64.bak" -Force -ErrorAction SilentlyContinue
-          }
-
-          $llvmpipeDll32 = Get-ChildItem -Path $extractPath -Recurse -Filter "opengl32.dll" |
-            Where-Object { $_.FullName -like "*x86*" } |
-            Select-Object -First 1
-
-          if ($llvmpipeDll32) {
-            Copy-Item $llvmpipeDll32.FullName $syswow64 -Force
-            Write-Host "32-bit llvmpipe installed too."
-          } else {
-            Write-Host "No 32-bit build found in this Mesa3D release; 32-bit apps will still use the original driver."
-          }
-
-          Write-Host "Mesa3D llvmpipe installed. Apps needing OpenGL now render in software."
+          Install-Mesa "x64" "$env:WINDIR\System32"
+          Install-Mesa "x86" "$env:WINDIR\SysWOW64"
 
       - name: Install Tailscale
         run: |
