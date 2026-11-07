@@ -208,8 +208,7 @@ jobs:
           }
 
           Write-Host "RDP user created successfully."
-
-            - name: Install Mesa3D (Software GPU - llvmpipe)
+      - name: Install Mesa3D (Software GPU - llvmpipe)
         continue-on-error: true
         run: |
           $release = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest"
