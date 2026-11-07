@@ -1,5 +1,5 @@
 name: RDP-1
-run-name: "RDP-1 #${{ github.run_number }} — ${{ github.event.inputs.deadline == '' && 'new session' || 'auto-continue' }}"
+run-name: "RDP-1 #${{ github.run_number }} - ${{ github.event.inputs.deadline == '' && 'new session' || 'auto-continue' }}"
 
 on:
   workflow_dispatch:
@@ -209,7 +209,7 @@ jobs:
 
           Write-Host "RDP user created successfully."
 
-            - name: Install Mesa3D (Software GPU - llvmpipe)
+      - name: Install Mesa3D (Software GPU - llvmpipe)
         continue-on-error: true
         run: |
           $release = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest"
