@@ -209,7 +209,7 @@ jobs:
 
           Write-Host "RDP user created successfully."
 
-      - name: Install Mesa3D (Software GPU - llvmpipe)
+            - name: Install Mesa3D (Software GPU - llvmpipe)
         continue-on-error: true
         run: |
           $release = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest"
@@ -226,7 +226,6 @@ jobs:
           & $sevenZip x $archive -o"$extractPath" -y | Out-Null
           Write-Host "7z exit code: $LASTEXITCODE"
 
-          # Diagnostics: show where the DLLs landed
           Get-ChildItem $extractPath -Recurse -Include opengl32.dll,libgallium_wgl.dll |
             ForEach-Object { Write-Host $_.FullName }
 
@@ -247,7 +246,6 @@ jobs:
 
           Install-Mesa "x64" "$env:WINDIR\System32"
           Install-Mesa "x86" "$env:WINDIR\SysWOW64"
-
       - name: Install Tailscale
         run: |
           Write-Host "Installing Tailscale..."
